@@ -177,7 +177,7 @@ def test_flash_attn_fixed_shift_gating(monkeypatch):
     device = "cuda"
     torch.random.manual_seed(3)
     q, k, v = [torch.randn(2, 512, 4, 128, device=device, dtype=torch.bfloat16) for _ in range(3)]
-    for kwargs in [{"causal": True}, {"softcap": 15.0}, {"num_splits": 2}, {"window_size": (64, 64)}]:
+    for kwargs in [{"causal": True}, {"softcap": 15.0}, {"window_size": (64, 64)}]:
         with pytest.raises(ValueError, match="fixed_shift"):
             flash_attn_func(q, k, v, softmax_mode="fixed_shift", **kwargs)
     with pytest.raises(ValueError, match="fixed_shift"):
@@ -203,3 +203,104 @@ def test_flash_attn_fixed_shift_gating(monkeypatch):
     assert torch.equal(out_env_grad, out_online_grad)
     assert torch.equal(out_env_causal, out_online_causal)
     assert not torch.equal(out_fixed, out_online)
+
+
+def _paged_block_diffusion_case(phase, lens, block, page_size, hq, hkv, d, device):
+    """LLaDA2-style paged block-diffusion call (FluxServe's FA4 backend): every task is one block of
+    queries attending non-causally to its request's paged KV prefix up to the end of that block."""
+    gen = torch.Generator().manual_seed(0)
+    q_offsets, q_lens = (list(lens), [block] * len(lens)) if phase == "decode" else ([0] * len(lens), list(lens))
+    pages_per_req = [math.ceil((o + n) / page_size) for o, n in zip(q_offsets, q_lens)]
+    num_pages = sum(pages_per_req) + 4
+    perm = torch.randperm(num_pages, generator=gen).to(torch.int32)  # scattered physical pages
+    page_table = torch.zeros(len(lens), max(pages_per_req), dtype=torch.int32)
+    used = 0
+    for r, npg in enumerate(pages_per_req):
+        page_table[r, :npg] = perm[used:used + npg]
+        used += npg
+    kv_lens, rows = [], []
+    for r, (o, n) in enumerate(zip(q_offsets, q_lens)):
+        for start in range(0, n, block):
+            kv_lens.append(o + start + block)
+            rows.append(r)
+    task_pages = math.ceil(max(kv_lens) / page_size)
+    task_page_table = page_table[:, :task_pages] if phase == "decode" else page_table[rows, :task_pages]
+    q = torch.randn(len(kv_lens) * block, hq, d, generator=gen).to(torch.bfloat16)
+    k_cache = torch.randn(num_pages, page_size, hkv, d, generator=gen).to(torch.bfloat16)
+    v_cache = torch.randn(num_pages, page_size, hkv, d, generator=gen).to(torch.bfloat16)
+    cu_seqlens_q = torch.arange(len(kv_lens) + 1, dtype=torch.int32) * block
+    tensors = [t.to(device) for t in (q, k_cache, v_cache, cu_seqlens_q, torch.tensor(kv_lens, dtype=torch.int32),
+                                      task_page_table.contiguous())]
+    return tensors, kv_lens
+
+
+@pytest.mark.parametrize("phase", ["decode", "prefill"])
+@pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize("hq, hkv", [(16, 4), (8, 1)])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_fixed_shift_paged_block_diffusion(hq, hkv, page_size, phase):
+    """LLaDA2.0 serving pattern (block 64): varlen tasks over a paged KV cache, TMA and non-TMA pages."""
+    device, block, d = "cuda", 64, 128
+    lens = [128, 1024, 3072, 64] if phase == "decode" else [1024, 512]
+    (q, k_cache, v_cache, cu_seqlens_q, seqused_k, page_table), kv_lens = _paged_block_diffusion_case(
+        phase, lens, block, page_size, hq, hkv, d, device
+    )
+    out, _ = flash_attn_varlen_func(
+        q, k_cache, v_cache, cu_seqlens_q=cu_seqlens_q, seqused_k=seqused_k, max_seqlen_q=block,
+        max_seqlen_k=max(kv_lens), page_table=page_table, softmax_mode="fixed_shift",
+    )
+    if is_fake_mode():
+        return
+    outs_model, outs_ref = [], []
+    for t, kv_len in enumerate(kv_lens):
+        pages = page_table[t, : math.ceil(kv_len / page_size)].long()
+        k_t = k_cache[pages].reshape(-1, hkv, d)[:kv_len][None]
+        v_t = v_cache[pages].reshape(-1, hkv, d)[:kv_len][None]
+        q_t = q[t * block:(t + 1) * block][None]
+        outs_model.append(attention_fixed_shift_ref(q_t, k_t, v_t)[0][0])
+        outs_ref.append(attention_ref(q_t.float(), k_t.float(), v_t.float())[0][0])
+    _check_out(out, torch.cat(outs_model), torch.cat(outs_ref))
+
+
+@pytest.mark.parametrize("num_splits", [3, 0])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_fixed_shift_split_kv(num_splits):
+    """Split-KV: each split's LSE is shift + ln(row_sum), so the combine reproduces the unsplit model."""
+    device = "cuda"
+    torch.random.manual_seed(4)
+    b, sq, sk, h, hk, d = 2, 128, 4096, 8, 2, 128
+    q = torch.randn(b, sq, h, d, device=device, dtype=torch.bfloat16)
+    k = torch.randn(b, sk, hk, d, device=device, dtype=torch.bfloat16)
+    v = torch.randn(b, sk, hk, d, device=device, dtype=torch.bfloat16)
+    out, lse = flash_attn_func(q, k, v, softmax_mode="fixed_shift", num_splits=num_splits, return_lse=True)
+    if is_fake_mode():
+        return
+    out_model, lse_model = attention_fixed_shift_ref(q, k, v)
+    out_ref, _, lse_ref = attention_ref(q.float(), k.float(), v.float(), return_lse=True)
+    _check_out(out, out_model, out_ref, lse, lse_model, lse_ref)
+
+
+@pytest.mark.parametrize("num_splits", [4, 0])
+@pytest.mark.parametrize("hq, hkv", [(16, 4), (8, 1)])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_fixed_shift_paged_decode_split_kv(hq, hkv, num_splits):
+    """LLaDA2.0 decode (one block per request over a long paged prefix) with split-KV."""
+    device, block, d, page_size = "cuda", 64, 128, 64
+    (q, k_cache, v_cache, cu_seqlens_q, seqused_k, page_table), kv_lens = _paged_block_diffusion_case(
+        "decode", [16384, 4096], block, page_size, hq, hkv, d, device
+    )
+    out, _ = flash_attn_varlen_func(
+        q, k_cache, v_cache, cu_seqlens_q=cu_seqlens_q, seqused_k=seqused_k, max_seqlen_q=block,
+        max_seqlen_k=max(kv_lens), page_table=page_table, softmax_mode="fixed_shift", num_splits=num_splits,
+    )
+    if is_fake_mode():
+        return
+    outs_model, outs_ref = [], []
+    for t, kv_len in enumerate(kv_lens):
+        pages = page_table[t, : math.ceil(kv_len / page_size)].long()
+        k_t = k_cache[pages].reshape(-1, hkv, d)[:kv_len][None]
+        v_t = v_cache[pages].reshape(-1, hkv, d)[:kv_len][None]
+        q_t = q[t * block:(t + 1) * block][None]
+        outs_model.append(attention_fixed_shift_ref(q_t, k_t, v_t)[0][0])
+        outs_ref.append(attention_ref(q_t.float(), k_t.float(), v_t.float())[0][0])
+    _check_out(out, torch.cat(outs_model), torch.cat(outs_ref))

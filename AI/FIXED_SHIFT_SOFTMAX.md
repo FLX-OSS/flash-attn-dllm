@@ -24,8 +24,9 @@ out, lse = flash_attn_func(q, k, v, softmax_mode="fixed_shift", softmax_shift=4.
   Ineligible calls fall back to the online softmax silently. An explicit kwarg that cannot be
   honored raises `ValueError` instead.
 - **Eligible calls:** SM100/SM110, bf16, `FlashAttentionForwardSm100` (not hd256 / MLA / gathered KV),
-  non-causal and non-local, no score_mod / mask_mod / softcap / learnable_sink / block sparsity /
-  split-KV / paged KV, and no input requiring grad.
+  non-causal and non-local, no score_mod / mask_mod / softcap / learnable_sink / block sparsity,
+  and no input requiring grad. Varlen, paged KV (TMA and non-TMA pages) and split-KV are supported
+  (each split's LSE is shift + ln of its row sum, so the combine weights stay consistent).
 - **`FLASH_ATTENTION_FIXED_SHIFT_HARDEN=1`** (not public yet) adds one `max.bf16x2` per pair that
   removes the evaluator's NaN band (see below).
 - **LSE** is `shift + ln(row_sum)`, i.e. the log of the denominator actually used.
@@ -149,3 +150,72 @@ query rows per (batch, head) against fp64 attention; cf. the paper's Table 4):
 | 32K | 2.35e-3 | 5.20e-3 | 1.46e-4 | 2.57e-4 |
 
 The paper reports 2.35e-3 for FA4 and 5.21e-3 for its TLX kernel (dense O, worst over lengths).
+
+## LLaDA 2.0 serving pattern (FluxServe FA4 backend)
+
+FluxServe (`fluxserve/backend/layers/attention/{fa4,metadata}.py`) runs LLaDA 2.0's block-causal
+attention without a mask. Every block of `block_length` (64) queries is a separate varlen task that
+attends non-causally to its request's paged KV prefix up to the end of that block:
+
+- **prefill:** a P-token prompt is P/64 tasks, task i sees `kv_len = (i + 1)·64`;
+- **decode** (each denoising step): one task per request, `kv_len = prefix + 64`.
+
+The call is `flash_attn_varlen_func(q, k_cache, v_cache, cu_seqlens_q, seqused_k, max_seqlen_q=64,
+page_table, causal=False)`, with page_size = block_length = 64. Per GPU this is 16 Q / 4 KV heads for
+LLaDA2.0-mini (TP 1) and 8 / 1 for LLaDA2.0-flash (TP 4), d = 128. FA4 picks pack_gqa, q_stage 2,
+1CTA and no S ping-pong. With page size 64 the K/V pages are loaded by `cp.async` from two load warps
+(non-TMA); TMA paging requires page_size == 128.
+
+Fixed-shift supports this pattern (varlen + paged KV, TMA and non-TMA, and split-KV):
+`tests/cute/test_flash_attn_fixed_shift.py::test_flash_attn_fixed_shift_paged_block_diffusion` and
+`::test_flash_attn_fixed_shift_paged_decode_split_kv`. Relative-ℓ2 error vs exact is 5.0e-3 (online
+2.2e-3), the same as for dense attention.
+
+Benchmark: `agent_space/llada2_bench.py`. Idle B200, CUDA-graph replays (FluxServe captures decode
+graphs), warm and interleaved, medians of 9. Times are µs per call; speedups are relative to online
+FA4 without split-KV unless stated otherwise. `+split` means FA4's split-KV heuristic (`num_splits=0`).
+
+**Decode.** Split-KV, not the softmax, dominates. At batch 1 one block per request gives only
+`kv_heads` (or 2·`kv_heads`) CTAs. Online FA4 with `num_splits=0` is 1.3-10.8x faster for mini and
+1.4-17x for flash-TP4. At batch 16 the heuristic over-splits mini (0.5-0.9x). Fixed-shift adds on top of
+split only when K/V are loaded by TMA:
+
+| mini decode, batch 1 | 1K | 4K | 16K | 64K |
+|---|---|---|---|---|
+| online, page 64 (production) | 18.8 | 53.4 | 191.6 | 849.1 |
+| online + split, page 64 | 14.7 | 18.8 | 28.7 | 78.5 |
+| fixed + split, page 64 | 14.4 | 18.5 | 28.5 | 78.9 |
+| online + split, page 128 | 17.3 | 21.2 | 31.8 | 76.5 |
+| fixed + split, page 128 | 14.9 | 18.4 | 26.5 | 70.0 |
+
+**Prefill**, fixed-shift vs online (same page size):
+
+| prompt | 1K | 4K | 16K | 64K |
+|---|---|---|---|---|
+| mini, page 64 | +8 % | +4 % | +3 % | −5 % |
+| mini, page 128 | +16 % | +20 % | +23 % | +14 % |
+| flash-TP4, page 64 | +11 % | +10 % | +12 % | +12 % |
+| flash-TP4, page 128 | +16 % | +18 % | +27 % | +26 % |
+
+Decode with split-KV at page 128, fixed vs online: mini +7..20 % and flash-TP4 +15..23 % at batch
+1-4 (+8..15 % at batch 16).
+
+**Against the current production configuration** (online, page 64, `num_splits=1`), attention time with
+page 128 + split-KV + fixed-shift (picking no-split where the heuristic over-splits) is:
+
+| | mini | flash-TP4 |
+|---|---|---|
+| decode, batch 1, 64K | 849 → 70.0 µs (12.1x) | 745 → 38.4 µs (19.4x) |
+| decode, batch 16, 64K | 882 → 783 µs (1.13x, no split) | 858 → 294 µs (2.9x) |
+| prefill, 64K prompt | 14.4 → 12.6 ms (1.14x) | 7.47 → 5.86 ms (1.27x) |
+
+Why page 64 hurts fixed-shift on mini: online FA4 runs at the same speed with either page size, but
+fixed-shift gets 17 % faster at page 128 (64K prefill: 15.2 → 12.6 ms). Fixed-shift's denser softmax (no
+MUFU stalls) appears to take issue slots from the two `cp.async` load warps. Mini moves 4x more KV than
+flash-TP4 per query head, so its loads are the bottleneck.
+
+**Implications for FluxServe:**
+1. Use split-KV for decode at small batch (`num_splits=0`, or a batch-aware choice since the
+   heuristic over-splits mini at batch 16). This is independent of fixed-shift and is the largest win.
+2. To get fixed-shift's gains on mini, use page_size 128 (TMA paging). FluxServe currently requires
+   page_size == block_length for its FA4 decode graph.

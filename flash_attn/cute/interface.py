@@ -694,8 +694,6 @@ def _resolve_softmax_mode(
     mask_mod,
     learnable_sink,
     use_block_sparsity: bool,
-    is_split_kv: bool,
-    page_table,
     requires_grad: bool,
 ) -> bool:
     """Whether this call uses the fixed-shift softmax forward (see AI/FIXED_SHIFT_SOFTMAX.md).
@@ -718,8 +716,6 @@ def _resolve_softmax_mode(
         (score_mod is not None or mask_mod is not None, "no score_mod / mask_mod / softcap"),
         (learnable_sink is not None, "no learnable_sink"),
         (use_block_sparsity, "no block sparsity"),
-        (is_split_kv, "num_splits must be 1"),
-        (page_table is not None, "no paged KV"),
         (requires_grad, "forward only: inputs must not require grad"),
     ]
     reasons = [reason for bad, reason in unsupported if bad]
@@ -1513,8 +1509,6 @@ def _flash_attn_fwd(
         mask_mod=mask_mod,
         learnable_sink=learnable_sink,
         use_block_sparsity=use_block_sparsity,
-        is_split_kv=is_split_kv,
-        page_table=page_table,
         requires_grad=requires_grad,
     )
     # One extra max.bf16x2 per pair removes the evaluator's NaN band (being evaluated, not public yet).
@@ -4250,10 +4244,10 @@ def flash_attn_func(
     """See flash_attn_varlen_func for the arguments.
 
     softmax_mode: "online" (default) or "fixed_shift"; None reads FLASH_ATTENTION_SOFTMAX_MODE per call.
-        "fixed_shift" (forward only; SM100/SM110, bf16, dense non-causal attention without score_mod,
-        mask_mod, softcap, learnable_sink, block sparsity, split-KV or paged KV, inputs not requiring
-        grad) replaces the running row max by the constant softmax_shift and every exp by a packed bf16
-        approximation (no MUFU.EX2, no output rescaling). Each weight is within ~1.2% of the exact
+        "fixed_shift" (forward only; SM100/SM110, bf16, dense non-causal attention, also varlen,
+        paged KV and split-KV, without score_mod, mask_mod, softcap, learnable_sink or block
+        sparsity, inputs not requiring grad) replaces the running row max by the constant
+        softmax_shift and every exp by a packed bf16 approximation (no MUFU.EX2, no rescaling). Each weight is within ~1.2% of the exact
         2^(.) and the output is normalized by the fp32 sum of the rounded weights; the returned LSE
         is ln of that sum plus the shift. An explicit request that cannot be honored raises; an
         env-driven one falls back to "online".
@@ -4413,10 +4407,10 @@ def flash_attn_varlen_func(
         and runs unchunked otherwise). Small launch-overhead cost. None disables.
 
     softmax_mode: "online" (default) or "fixed_shift"; None reads FLASH_ATTENTION_SOFTMAX_MODE per call.
-        "fixed_shift" (forward only; SM100/SM110, bf16, dense non-causal attention without score_mod,
-        mask_mod, softcap, learnable_sink, block sparsity, split-KV or paged KV, inputs not requiring
-        grad) replaces the running row max by the constant softmax_shift and every exp by a packed bf16
-        approximation (no MUFU.EX2, no output rescaling). Each weight is within ~1.2% of the exact
+        "fixed_shift" (forward only; SM100/SM110, bf16, dense non-causal attention, also varlen,
+        paged KV and split-KV, without score_mod, mask_mod, softcap, learnable_sink or block
+        sparsity, inputs not requiring grad) replaces the running row max by the constant
+        softmax_shift and every exp by a packed bf16 approximation (no MUFU.EX2, no rescaling). Each weight is within ~1.2% of the exact
         2^(.) and the output is normalized by the fp32 sum of the rounded weights; the returned LSE
         is ln of that sum plus the shift. An explicit request that cannot be honored raises; an
         env-driven one falls back to "online".

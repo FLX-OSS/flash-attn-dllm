@@ -241,8 +241,8 @@ class FlashAttentionForwardSm100:
         self.use_fixed_shift = use_fixed_shift
         self.fixed_shift_harden = fixed_shift_harden
         if self.use_fixed_shift:
-            assert not (is_causal or is_local or is_split_kv or use_s_ping_pong), (
-                "fixed-shift softmax supports dense attention without split-KV or S ping-pong"
+            assert not (is_causal or is_local or use_s_ping_pong), (
+                "fixed-shift softmax supports dense attention without S ping-pong"
             )
             assert score_mod is None and mask_mod is None, "fixed-shift softmax: no score_mod / mask_mod"
         self.score_vec_size: cutlass.Constexpr = getattr(

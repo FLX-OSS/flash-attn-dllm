@@ -678,6 +678,56 @@ def _mla_fwd_plan(
 
 
 
+SOFTMAX_MODES = ("online", "fixed_shift")
+
+
+def _resolve_softmax_mode(
+    softmax_mode: Optional[str],
+    *,
+    arch: int,
+    dtype: torch.dtype,
+    is_mla: bool,
+    use_dedicated_hd256_kernel: bool,
+    causal: bool,
+    local: bool,
+    score_mod,
+    mask_mod,
+    learnable_sink,
+    use_block_sparsity: bool,
+    is_split_kv: bool,
+    page_table,
+    requires_grad: bool,
+) -> bool:
+    """Whether this call uses the fixed-shift softmax forward (see AI/FIXED_SHIFT_SOFTMAX.md).
+
+    An explicit softmax_mode="fixed_shift" that cannot be honored raises; when the request comes from
+    FLASH_ATTENTION_SOFTMAX_MODE (read per call) the call silently uses the online softmax instead.
+    """
+    explicit = softmax_mode is not None
+    mode = softmax_mode if explicit else os.environ.get("FLASH_ATTENTION_SOFTMAX_MODE", "online")
+    if mode not in SOFTMAX_MODES:
+        raise ValueError(f"softmax_mode must be one of {SOFTMAX_MODES}, got {mode!r}")
+    if mode == "online":
+        return False
+    unsupported = [
+        (arch // 10 not in [10, 11], "needs SM100 / SM110"),
+        (dtype != torch.bfloat16, "needs bf16 inputs"),
+        (is_mla, "not supported for MLA / gathered KV"),
+        (use_dedicated_hd256_kernel, "not supported for head_dim 256"),
+        (causal or local, "dense attention only (no causal / local window)"),
+        (score_mod is not None or mask_mod is not None, "no score_mod / mask_mod / softcap"),
+        (learnable_sink is not None, "no learnable_sink"),
+        (use_block_sparsity, "no block sparsity"),
+        (is_split_kv, "num_splits must be 1"),
+        (page_table is not None, "no paged KV"),
+        (requires_grad, "forward only: inputs must not require grad"),
+    ]
+    reasons = [reason for bad, reason in unsupported if bad]
+    if reasons and explicit:
+        raise ValueError(f"softmax_mode='fixed_shift' is not supported here: {'; '.join(reasons)}")
+    return not reasons
+
+
 def _flash_attn_fwd(
     q: Optional[torch.Tensor],
     k: Optional[torch.Tensor],
@@ -720,6 +770,8 @@ def _flash_attn_fwd(
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
+    softmax_mode: Optional[str] = None,
+    softmax_shift: float = 0.0,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]
 ]:
@@ -1449,6 +1501,29 @@ def _flash_attn_fwd(
         )
     )
 
+    use_fixed_shift = _resolve_softmax_mode(
+        softmax_mode,
+        arch=arch,
+        dtype=v.dtype,
+        is_mla=qv is not None or gather_kv_indices is not None,
+        use_dedicated_hd256_kernel=use_dedicated_hd256_kernel,
+        causal=causal,
+        local=local,
+        score_mod=score_mod,
+        mask_mod=mask_mod,
+        learnable_sink=learnable_sink,
+        use_block_sparsity=use_block_sparsity,
+        is_split_kv=is_split_kv,
+        page_table=page_table,
+        requires_grad=requires_grad,
+    )
+    # One extra max.bf16x2 per pair removes the evaluator's NaN band (being evaluated, not public yet).
+    fixed_shift_harden = use_fixed_shift and os.environ.get("FLASH_ATTENTION_FIXED_SHIFT_HARDEN", "0") == "1"
+    fixed_shift_log2 = float(softmax_shift) * utils.LOG2_E if use_fixed_shift else None
+    if use_fixed_shift:
+        use_s_ping_pong = False
+        fa_logging.fa_log(1, f"softmax_mode=fixed_shift shift={softmax_shift} harden={fixed_shift_harden}")
+
     compile_key = (
         mla_1cta,
         mla_1cta_kb64,
@@ -1518,6 +1593,8 @@ def _flash_attn_fwd(
         disable_sparse_kv_bitmask,
         fa_logging.get_fa_log_level(),
         use_dedicated_hd256_kernel and cu_seqlens_q is not None and host_max_seqlen_q is None,
+        use_fixed_shift,
+        fixed_shift_harden,
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -1771,6 +1848,8 @@ def _flash_attn_fwd(
                 if not use_dedicated_hd256_kernel:
                     fa_fwd_kwargs["has_tile_count_semaphore"] = tile_count_semaphore is not None
                     fa_fwd_kwargs["use_s_ping_pong"] = use_s_ping_pong
+                    fa_fwd_kwargs["use_fixed_shift"] = use_fixed_shift
+                    fa_fwd_kwargs["fixed_shift_harden"] = fixed_shift_harden
                 fa_fwd = flash_fwd_obj_cls(head_dim, head_dim_v, **fa_fwd_kwargs)
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
@@ -1865,6 +1944,7 @@ def _flash_attn_fwd(
                     cu_total_splits_m_blocks_tensor,
                     blocks_to_batch_idx_tensor,
                     max_seqlen_q,
+                    fixed_shift_log2,
                 ])
             elif arch // 10 in [8, 9, 12]:
                 compile_args.extend([
@@ -1963,6 +2043,7 @@ def _flash_attn_fwd(
                     cu_total_splits_m_blocks,
                     blocks_to_batch_idx,
                     max_seqlen_q,
+                    fixed_shift_log2,
                 ])
             elif arch // 10 in [8, 9, 12]:
                 call_args.extend([
@@ -3793,6 +3874,8 @@ class FlashAttnFunc(torch.autograd.Function):
         return_lse: bool = False,
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
+        softmax_mode: Optional[str] = None,
+        softmax_shift: float = 0.0,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3807,6 +3890,8 @@ class FlashAttnFunc(torch.autograd.Function):
             k,
             v,
             qv=qv,
+            softmax_mode=softmax_mode,
+            softmax_shift=softmax_shift,
             softmax_scale=softmax_scale,
             causal=causal,
             window_size_left=window_size[0],
@@ -3870,9 +3955,9 @@ class FlashAttnFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 14)
+                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 16)
             else:
-                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 14)
+                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 16)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -3901,7 +3986,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 14)
+            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 16)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -3941,6 +4026,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         disable_scheduler_metadata: bool = False,
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
+        softmax_mode: Optional[str] = None,
+        softmax_shift: float = 0.0,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3982,6 +4069,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             seqlen_k_per_split=seqlen_k_per_split,
             disable_scheduler_metadata=disable_scheduler_metadata,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
+            softmax_mode=softmax_mode,
+            softmax_shift=softmax_shift,
         )
         ctx.save_for_backward(
             q,
@@ -4055,9 +4144,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 16)
+                return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 18)
             else:
-                return dq, dk, dv, dqv, *((None,) * 12), dsink, *((None,) * 16)
+                return dq, dk, dv, dqv, *((None,) * 12), dsink, *((None,) * 18)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -4091,7 +4180,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 16)
+            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 18)
 
 
 def _validate_gather_bwd_kwargs(
@@ -4155,7 +4244,26 @@ def flash_attn_func(
     return_lse: bool = False,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
+    softmax_mode: Optional[str] = None,
+    softmax_shift: float = 0.0,
 ):
+    """See flash_attn_varlen_func for the arguments.
+
+    softmax_mode: "online" (default) or "fixed_shift"; None reads FLASH_ATTENTION_SOFTMAX_MODE per call.
+        "fixed_shift" (forward only; SM100/SM110, bf16, dense non-causal attention without score_mod,
+        mask_mod, softcap, learnable_sink, block sparsity, split-KV or paged KV, inputs not requiring
+        grad) replaces the running row max by the constant softmax_shift and every exp by a packed bf16
+        approximation (no MUFU.EX2, no output rescaling). Each weight is within ~1.2% of the exact
+        2^(.) and the output is normalized by the fp32 sum of the rounded weights; the returned LSE
+        is ln of that sum plus the shift. An explicit request that cannot be honored raises; an
+        env-driven one falls back to "online".
+        Range contract (unchecked): every z = softmax_scale * q.k - softmax_shift must satisfy
+        -87 < z < 88.7 - ln(seqlen_k) - ln(max|V|) (about +-70). Below -87 a score can turn its whole
+        row into NaN (z in [-88, -87]) or, below -264, wrap around; above the bound the row sum or
+        output overflows, and z >~ 90 is silently dropped. See AI/FIXED_SHIFT_SOFTMAX.md.
+    softmax_shift: the constant row shift for softmax_mode="fixed_shift", in natural-log units of
+        softmax_scale * q.k. Ignored otherwise.
+    """
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
     )
@@ -4197,6 +4305,8 @@ def flash_attn_func(
         return_lse,
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
+        softmax_mode,
+        softmax_shift,
     )
 
 
@@ -4234,6 +4344,8 @@ def flash_attn_varlen_func(
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
+    softmax_mode: Optional[str] = None,
+    softmax_shift: float = 0.0,
 ):
     """
     Tensor arguments:
@@ -4299,6 +4411,21 @@ def flash_attn_varlen_func(
         gather_bwd_recompute_p, making the whole backward transient bounded by the chunk.
         Must be a positive int (anything else raises); requires varlen or batch 1 (warns
         and runs unchunked otherwise). Small launch-overhead cost. None disables.
+
+    softmax_mode: "online" (default) or "fixed_shift"; None reads FLASH_ATTENTION_SOFTMAX_MODE per call.
+        "fixed_shift" (forward only; SM100/SM110, bf16, dense non-causal attention without score_mod,
+        mask_mod, softcap, learnable_sink, block sparsity, split-KV or paged KV, inputs not requiring
+        grad) replaces the running row max by the constant softmax_shift and every exp by a packed bf16
+        approximation (no MUFU.EX2, no output rescaling). Each weight is within ~1.2% of the exact
+        2^(.) and the output is normalized by the fp32 sum of the rounded weights; the returned LSE
+        is ln of that sum plus the shift. An explicit request that cannot be honored raises; an
+        env-driven one falls back to "online".
+        Range contract (unchecked): every z = softmax_scale * q.k - softmax_shift must satisfy
+        -87 < z < 88.7 - ln(seqlen_k) - ln(max|V|) (about +-70). Below -87 a score can turn its whole
+        row into NaN (z in [-88, -87]) or, below -264, wrap around; above the bound the row sum or
+        output overflows, and z >~ 90 is silently dropped. See AI/FIXED_SHIFT_SOFTMAX.md.
+    softmax_shift: the constant row shift for softmax_mode="fixed_shift", in natural-log units of
+        softmax_scale * q.k. Ignored otherwise.
     """
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
@@ -4337,6 +4464,8 @@ def flash_attn_varlen_func(
         disable_scheduler_metadata,
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
+        softmax_mode,
+        softmax_shift,
     )
 
 

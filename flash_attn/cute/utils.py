@@ -847,6 +847,111 @@ def e2e_asm2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float32, Flo
     return out0, out1
 
 
+# Packed BF16 exp2 for the fixed-shift softmax (arXiv 2610.02229 §3.3, see AI/FIXED_SHIFT_SOFTMAX.md).
+# For a pair of fp32 scores s, with y = s * scale_log2 - shift_log2:
+#   t  = fma.rn.f32x2(s, A, B)    A = 128 * scale_log2, B = PACKED_EXP2_MAGIC - 128 * shift_log2.
+#        The 1.5 * 2^23 in B makes fp32 spacing 1, so the low 16 bits of t hold round(128 y + 127*128 + OFF):
+#        Schraudolph's BF16 bit pattern 2^n (1 + f).
+#   R  = prmt t0, t1 (low halves) -> bf16x2.
+#   R2 = R + K per lane; the mantissa carry into the exponent for f >= 1 - K/128 puts a kink there.
+#   P  = relu(kappa * R + R2): a 2-piece chord interpolation of 2^f; relu zeroes underflowed lanes.
+# Normalized output is unaffected by the common gain; OFF centres it so P / 2^y is in [0.988, 1.012].
+# Accurate for y in (-124.4, 128). y in [-126.9, -125.5] gives NaN unless `harden` (one extra
+# max.bf16x2 per pair clamps negative / NaN lanes to -0 before the add); y in [128, 130.5] gives inf/NaN,
+# y >= 130.6 (129.6 hardened) silently becomes 0, and y < -382.9 wraps around. -inf gives a tiny positive
+# value, so masks must use packed_exp2_mask_value.
+PACKED_EXP2_K = 63
+PACKED_EXP2_KAPPA_BF16 = 0x3FB4  # 1.40625
+PACKED_EXP2_OFF = -198
+PACKED_EXP2_MAGIC = 1.5 * 2**23 + 127 * 128 + PACKED_EXP2_OFF
+# Encoded exponent that maps to an exact zero (middle of the relu-zero range (-381.5, -127)).
+PACKED_EXP2_MASK_Y = -256.0
+
+
+@dsl_user_op
+def packed_exp2_bf16x2(
+    s0: Float32,
+    s1: Float32,
+    A: Float32,
+    B: Float32,
+    harden: bool = False,
+    *,
+    loc=None,
+    ip=None,
+) -> Int32:
+    """bf16x2 approximation of (2^y0, 2^y1) with y = s * A / 128 + (B - PACKED_EXP2_MAGIC) / 128.
+
+    Returns the packed bf16x2 word (lo = s0, hi = s1). See the comment above PACKED_EXP2_K.
+    """
+    kappa = (PACKED_EXP2_KAPPA_BF16 << 16) | PACKED_EXP2_KAPPA_BF16
+    k_add = (PACKED_EXP2_K << 16) | PACKED_EXP2_K
+    # -0.0 (not +0.0) so clamped lanes give exactly 0: R2 = 0x803F stays negative and relu zeroes it.
+    clamp = "mov.b32 z, 0x80008000;\n\tmax.bf16x2 r, r, z;\n\t" if harden else ""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(x).ir_value(loc=loc, ip=ip) for x in (s0, s1, A, B)],
+            "{\n\t"
+            ".reg .b64 s, a, b, t;\n\t"
+            ".reg .b32 t0, t1, r, r2, kap, z;\n\t"
+            "mov.b64 s, {$1, $2};\n\t"
+            "mov.b64 a, {$3, $3};\n\t"
+            "mov.b64 b, {$4, $4};\n\t"
+            "fma.rn.f32x2 t, s, a, b;\n\t"
+            "mov.b64 {t0, t1}, t;\n\t"
+            "prmt.b32 r, t0, t1, 0x5410;\n\t"
+            f"{clamp}"
+            f"add.s32 r2, r, {k_add};\n\t"
+            f"mov.b32 kap, {kappa};\n\t"
+            "fma.rn.relu.bf16x2 $0, r, kap, r2;\n\t"
+            "}\n",
+            "=r,f,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def add_bf16x2_to_f32x2(
+    p: Int32, acc_lo: Float32, acc_hi: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    """(acc_lo + bf16 lo(p), acc_hi + bf16 hi(p)) in fp32, one add.rn.f32.bf16 (FHADD) per lane."""
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32()]),
+        [
+            Int32(p).ir_value(loc=loc, ip=ip),
+            Float32(acc_lo).ir_value(loc=loc, ip=ip),
+            Float32(acc_hi).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t"
+        ".reg .b16 lo, hi;\n\t"
+        "mov.b32 {lo, hi}, $2;\n\t"
+        "add.rn.f32.bf16 $0, lo, $3;\n\t"
+        "add.rn.f32.bf16 $1, hi, $4;\n\t"
+        "}\n",
+        "=f,=f,r,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return (
+        Float32(llvm.extractvalue(T.f32(), out, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), out, [1], loc=loc, ip=ip)),
+    )
+
+
+def packed_exp2_coeffs(scale_log2, shift_log2):
+    """(A, B) fp32 operands of packed_exp2_bf16x2. Works on Python floats and on DSL Float32."""
+    return scale_log2 * 128.0, PACKED_EXP2_MAGIC - shift_log2 * 128.0
+
+
+def packed_exp2_mask_value(scale_log2, shift_log2):
+    """A finite score that packed_exp2_bf16x2 maps to exactly 0; masks must use it instead of -inf."""
+    return (shift_log2 + PACKED_EXP2_MASK_Y) / scale_log2
+
+
 @dsl_user_op
 def domain_offset_aligned(
     coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None

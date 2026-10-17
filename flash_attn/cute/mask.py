@@ -77,13 +77,15 @@ def mask_r2p_lambda(
     X: cute.Tensor,
     mask_gen_fn: cutlass.Constexpr[MaskGenFn],
     rank1: bool = False,
+    fill_value: Optional[Float32] = None,
 ) -> None:
     """Apply R2P masking with a custom bitmask generator.
 
     mask_gen_fn(chunk_idx: constexpr int) -> Uint32:
         Returns a 32-bit bitmask for the chunk. Bit i set means column
-        chunk_idx * chunk_size + i is KEPT; bit i clear means masked to -inf.
+        chunk_idx * chunk_size + i is KEPT; bit i clear means masked to fill_value (default -inf).
     """
+    fill = -Float32.inf if const_expr(fill_value is None) else fill_value
     ncol = const_expr(cute.size(X.shape[cute.rank(X) - 1]) if not rank1 else cute.size(X.shape))
     # 32-column chunks. The mask_gen_fn returns a Uint32 bitmask (1=keep).
     CHUNK_SIZE = MASK_R2P_CHUNK_SIZE
@@ -94,10 +96,10 @@ def mask_r2p_lambda(
             in_bound = cutlass.Boolean(mask & (Uint32(1) << i))
             c = s * CHUNK_SIZE + i
             if const_expr(rank1):
-                X[c] = X[c] if in_bound else -Float32.inf
+                X[c] = X[c] if in_bound else fill
             else:
                 for r in cutlass.range_constexpr(cute.size(X.shape[0])):
-                    X[r, c] = X[r, c] if in_bound else -Float32.inf
+                    X[r, c] = X[r, c] if in_bound else fill
 
 
 @cute.jit
@@ -632,8 +634,13 @@ class AttentionMask:
         check_q_boundary: bool = False,
         r2p: bool = True,
         rBitmask: Optional[cute.Tensor] = None,
+        fill_value: Optional[Float32] = None,
     ) -> None:
+        """fill_value replaces -inf for masked scores; only the seqlen-only mask supports it."""
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
+        assert fill_value is None or (
+            rBitmask is None and not mask_causal and not mask_local and mask_mod is None
+        ), "fill_value is only supported for the seqlen-only mask"
         acc_shape = (self.tile_m, self.tile_n)
         cS = cute.make_identity_tensor(acc_shape if not self.swap_AB else acc_shape[::-1])
         tScS = thr_mma.partition_C(cS)
@@ -659,16 +666,18 @@ class AttentionMask:
         elif const_expr(not mask_causal and not mask_local and mask_mod is None):
             if const_expr(mask_seqlen):
                 if const_expr(not r2p):
+                    fill = -Float32.inf if const_expr(fill_value is None) else fill_value
                     for i in cutlass.range(cute.size(tScS_t2r.shape), unroll_full=True):
                         # if tScS_t2r[i][1] >= seqlenk_col_limit:
                         #     acc_S[i] = -Float32.inf
                         # For some reason the 2 lines above generate really bad SASS
-                        acc_S[i] = -Float32.inf if tScS_t2r[i][1] >= seqlenk_col_limit else acc_S[i]
+                        acc_S[i] = fill if tScS_t2r[i][1] >= seqlenk_col_limit else acc_S[i]
                 else:
                     mask_r2p_lambda(
                         acc_S,
                         lambda s: r2p_bitmask_below(seqlenk_col_limit, s),
                         rank1=True,
+                        fill_value=fill_value,
                     )
 
         elif const_expr(not mask_causal and not mask_local and mask_mod is not None):

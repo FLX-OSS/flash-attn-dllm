@@ -122,6 +122,9 @@ _FP8_TUNING_CONFIG = {
     # (0.94x), hence keyed on is_causal=True only.
     (False, True, 128, False): {'ex2_emu_freq': 8, 'ex2_emu_start_frg': 1},
 }
+# Fixed-shift softmax (use_fixed_shift) register split, keyed by (use_2cta_instrs, head_dim_padded,
+# is_sm103): {"num_regs_softmax", "num_regs_correction"}; num_regs_other is derived. Overrides the split above.
+_FIXED_SHIFT_TUNING_CONFIG = {}
 _FP8_SMALL_HDIM_REGS = {
     False: {"num_regs_softmax": 168, "num_regs_correction": 96, "num_regs_other": 80},
     True: {"num_regs_softmax": 152, "num_regs_correction": 96, "num_regs_other": 112},
@@ -168,6 +171,8 @@ class FlashAttentionForwardSm100:
         has_tile_count_semaphore: bool = False,
         seqlen_k_per_split: Optional[int] = None,
         use_s_ping_pong: cutlass.Constexpr[bool] = False,
+        use_fixed_shift: cutlass.Constexpr[bool] = False,
+        fixed_shift_harden: cutlass.Constexpr[bool] = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -230,6 +235,16 @@ class FlashAttentionForwardSm100:
         )
         self.score_mod = score_mod
         self.mask_mod = mask_mod
+        # Fixed-shift softmax (softmax_mode="fixed_shift", arXiv 2610.02229): a constant row shift instead
+        # of the running row max, so O is never rescaled, and a packed bf16 exp2 for every score instead
+        # of MUFU.EX2. See AI/FIXED_SHIFT_SOFTMAX.md for the range contract.
+        self.use_fixed_shift = use_fixed_shift
+        self.fixed_shift_harden = fixed_shift_harden
+        if self.use_fixed_shift:
+            assert not (is_causal or is_local or is_split_kv or use_s_ping_pong), (
+                "fixed-shift softmax supports dense attention without split-KV or S ping-pong"
+            )
+            assert score_mod is None and mask_mod is None, "fixed-shift softmax: no score_mod / mask_mod"
         self.score_vec_size: cutlass.Constexpr = getattr(
             score_mod, "__vec_size__", 1 if cutlass.const_expr(has_aux_tensors) else 2
         )
@@ -248,6 +263,7 @@ class FlashAttentionForwardSm100:
             and self.score_mod is None
             and self.mask_mod is None
             and self.head_dim_padded != 32
+            and not self.use_fixed_shift
         )
         # enable_ex2_emu is derived: True if tuning config has freq > 0, else fallback to default logic
         _default_enable_ex2_emu = (self.head_dim_padded <= 128 or (self.head_dim_padded == 192 and self.use_2cta_instrs and not self.is_causal and not self.is_local)) and not is_sm103
@@ -390,6 +406,14 @@ class FlashAttentionForwardSm100:
                 self.num_regs_softmax = 184
                 self.num_regs_correction = 64
             self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
+        if self.use_fixed_shift and not paged_kv_non_tma:
+            fs_tune = _FIXED_SHIFT_TUNING_CONFIG.get(
+                (self.use_2cta_instrs, self.head_dim_padded, self.is_sm103), {}
+            )
+            if "num_regs_softmax" in fs_tune:
+                self.num_regs_softmax = fs_tune["num_regs_softmax"]
+                self.num_regs_correction = fs_tune["num_regs_correction"]
+                self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
 
         self.buffer_align_bytes = 1024
 
@@ -464,6 +488,7 @@ class FlashAttentionForwardSm100:
         mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None,
         mBlocksToBatchIdx: Optional[cute.Tensor] = None,
         max_seqlen_q: Int32 | int | None = None,
+        softmax_shift_log2: Float32 | float | None = None,  # fixed-shift softmax only
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -517,6 +542,15 @@ class FlashAttentionForwardSm100:
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
         if const_expr(self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
+        if const_expr(self.use_fixed_shift):
+            if const_expr(self.q_dtype != cutlass.BFloat16):
+                raise TypeError("fixed-shift softmax requires bf16 inputs")
+            if const_expr(learnable_sink is not None or blocksparse_tensors is not None):
+                raise NotImplementedError("fixed-shift softmax: no learnable sink / block sparsity")
+            assert softmax_shift_log2 is not None, "fixed-shift softmax needs softmax_shift_log2"
+            softmax_shift_log2 = Float32(softmax_shift_log2)
+        else:
+            softmax_shift_log2 = None
         if const_expr(self.q_dtype.width == 8):
             paged_kv_non_tma = not self.use_tma_KV
             if const_expr(self.head_dim_padded < 96):
@@ -869,6 +903,7 @@ class FlashAttentionForwardSm100:
             aux_data,
             fastdiv_mods,
             head_divmod,
+            softmax_shift_log2,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -932,6 +967,7 @@ class FlashAttentionForwardSm100:
         aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         head_divmod=None,
+        softmax_shift_log2: Optional[Float32] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1415,6 +1451,7 @@ class FlashAttentionForwardSm100:
                 head_divmod=head_divmod,
                 blocksparse_tensors=blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
+                softmax_shift_log2=softmax_shift_log2,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -1462,6 +1499,7 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
+                softmax_shift_log2=softmax_shift_log2,
             )
             tmem_alloc_barrier.arrive()
 
@@ -2185,6 +2223,7 @@ class FlashAttentionForwardSm100:
         head_divmod=None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         tile_scheduler=None,
+        softmax_shift_log2: Optional[Float32] = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -2341,6 +2380,13 @@ class FlashAttentionForwardSm100:
                 max_offset=max_offset,
             )
             softmax.reset()
+            # Fixed-shift softmax: packed exp2 coefficients, and the finite score that maps to exactly 0
+            # (-inf would map to a tiny positive weight).
+            fixed_shift_coeffs = None
+            mask_fill_value = None
+            if const_expr(self.use_fixed_shift):
+                fixed_shift_coeffs = utils.packed_exp2_coeffs(softmax_scale_log2_eff, softmax_shift_log2)
+                mask_fill_value = utils.packed_exp2_mask_value(softmax_scale_log2_eff, softmax_shift_log2)
 
             if const_expr(self.use_block_sparsity):
                 tile_block_count = get_total_block_count(
@@ -2384,6 +2430,7 @@ class FlashAttentionForwardSm100:
                 aux_data=aux_data,
                 fastdiv_mods=fastdiv_mods,
                 head_divmod=head_divmod,
+                fixed_shift_coeffs=fixed_shift_coeffs,
             )
 
             if const_expr(not self.use_s_ping_pong):
@@ -2448,7 +2495,7 @@ class FlashAttentionForwardSm100:
                         s0_s1_sequence_phase,
                         n_block_max - 1,
                         is_first=True,
-                        mask_fn=partial(mask_fn, mask_seqlen=True),
+                        mask_fn=partial(mask_fn, mask_seqlen=True, fill_value=mask_fill_value),
                     )
                     n_block_max -= 1
                     # Next couple of iterations with causal masking
@@ -2505,7 +2552,7 @@ class FlashAttentionForwardSm100:
                     else:
                         sm_stats_index = stage
                     sScale[tidx + sm_stats_index * self.m_block_size] = softmax.row_sum[0]
-                    if const_expr(mLSE is not None or learnable_sink is not None):
+                    if const_expr((mLSE is not None or learnable_sink is not None) and not self.use_fixed_shift):
                         sScale[
                             tidx + sm_stats_index * self.m_block_size + self.s_p_o_stage * self.m_block_size
                         ] = softmax.row_max[0]
@@ -2578,6 +2625,7 @@ class FlashAttentionForwardSm100:
         head_divmod=None,
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
+        fixed_shift_coeffs: Optional[Tuple[Float32, Float32]] = None,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
@@ -2617,6 +2665,17 @@ class FlashAttentionForwardSm100:
         else:
             s_p_o_index = stage
             pipeline_s_p_o.consumer_wait_w_index_phase(stage, s_p_o_consumer_count)
+        if const_expr(self.use_s_ping_pong):
+            sm_stats_index = (s_p_o_consumer_count - 1) & 1
+        else:
+            sm_stats_index = s_p_o_index
+        if const_expr(self.use_fixed_shift):
+            # No row max to publish and nothing to rescale: signal the correction warps right away so
+            # they release S/P/O early. The per-step sm_stats credit below must stay: it keeps this warp
+            # from arriving twice on its named barrier before the correction warp syncs (see
+            # AI/FIXED_SHIFT_SOFTMAX.md).
+            if const_expr(not self.use_s_ping_pong or not is_first):
+                sm_stats_barrier.arrive_w_index(index=sm_stats_index * 4 + warp_idx)
         tSrS_t2r = cute.make_rmem_tensor(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         hw_row_max = Float32(-Float32.inf)
         if const_expr(self.use_ldred_rowmax):
@@ -2646,31 +2705,28 @@ class FlashAttentionForwardSm100:
 
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block)
-        # Masked iterations reduce over post-mask values in software.
-        if const_expr(self.use_ldred_rowmax and mask_fn is None):
-            row_max, acc_scale = softmax.update_row_max_precomputed(hw_row_max, is_first)
-        else:
-            row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
+        if const_expr(not self.use_fixed_shift):
+            # Masked iterations reduce over post-mask values in software.
+            if const_expr(self.use_ldred_rowmax and mask_fn is None):
+                row_max, acc_scale = softmax.update_row_max_precomputed(hw_row_max, is_first)
+            else:
+                row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
 
-        if const_expr(self.use_s_ping_pong):
-            sm_stats_index = (s_p_o_consumer_count - 1) & 1
-        else:
-            sm_stats_index = s_p_o_index
-        if const_expr(not is_first):
-            # tSrScale_r2t = cute.make_rmem_tensor(thr_tmem_store_scale.partition_S(tScScale).shape, Float32)
-            # tSrScale_r2t[0] = acc_scale
-            # cute.copy(thr_tmem_store_scale, tSrScale_r2t, tStScale_r2t)
-            # cute.arch.fence_view_async_tmem_store()
-            thread_idx = thr_tmem_load.thr_idx
-            sScale[thread_idx + sm_stats_index * self.m_block_size] = acc_scale
-            # if thread_idx == 0: cute.printf("softmax acc_scale stage %d: %f, row_max = %f\n", stage, acc_scale, row_max)
-        # Notify correction wg that row_max is ready
-        # pipeline_sm_stats.producer_commit_w_index(stage)
-        if const_expr(not self.use_s_ping_pong or not is_first):
-            sm_stats_barrier.arrive_w_index(index=sm_stats_index * 4 + warp_idx)
+            if const_expr(not is_first):
+                # tSrScale_r2t = cute.make_rmem_tensor(thr_tmem_store_scale.partition_S(tScScale).shape, Float32)
+                # tSrScale_r2t[0] = acc_scale
+                # cute.copy(thr_tmem_store_scale, tSrScale_r2t, tStScale_r2t)
+                # cute.arch.fence_view_async_tmem_store()
+                thread_idx = thr_tmem_load.thr_idx
+                sScale[thread_idx + sm_stats_index * self.m_block_size] = acc_scale
+                # if thread_idx == 0: cute.printf("softmax acc_scale stage %d: %f, row_max = %f\n", stage, acc_scale, row_max)
+            # Notify correction wg that row_max is ready
+            # pipeline_sm_stats.producer_commit_w_index(stage)
+            if const_expr(not self.use_s_ping_pong or not is_first):
+                sm_stats_barrier.arrive_w_index(index=sm_stats_index * 4 + warp_idx)
 
-        # if thread_idx == 0 and stage == 0: cute.print_tensor(tSrS_t2r)
-        softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
+            # if thread_idx == 0 and stage == 0: cute.print_tensor(tSrS_t2r)
+            softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
         # Sequence barrier wait
         if const_expr(self.s0_s1_barrier):
             pipeline_s0_s1_sequence.sync_object_full.wait(stage, s0_s1_sequence_phase)
@@ -2681,12 +2737,15 @@ class FlashAttentionForwardSm100:
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype), tSrS_t2r.layout
         )
         # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
-        softmax.apply_exp2_convert(
-            tSrS_t2r,
-            tSrP_r2t,
-            ex2_emu_freq=self.ex2_emu_freq,
-            ex2_emu_start_frg=self.ex2_emu_start_frg,
-        )
+        if const_expr(self.use_fixed_shift):
+            softmax.apply_packed_exp2(tSrS_t2r, tSrP_r2t, *fixed_shift_coeffs, harden=self.fixed_shift_harden)
+        else:
+            softmax.apply_exp2_convert(
+                tSrS_t2r,
+                tSrP_r2t,
+                ex2_emu_freq=self.ex2_emu_freq,
+                ex2_emu_start_frg=self.ex2_emu_start_frg,
+            )
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
             pipeline_s0_s1_sequence.sync_object_full.arrive(1 - stage, dst=None)
@@ -2708,13 +2767,16 @@ class FlashAttentionForwardSm100:
                 pipeline_p_lastsplit.producer_commit_w_index(s_p_o_index)
         else:
             pipeline_s_p_o.consumer_release_w_index(s_p_o_index)
+        if const_expr(self.use_fixed_shift):
+            softmax.update_row_sum_packed(tSrP_r2t, is_first)
         if const_expr(self.use_s_ping_pong):
             pipeline_sm_stats.producer_acquire_w_index_phase(
                 s_p_o_consumer_count & 1, 1 ^ ((s_p_o_consumer_count >> 1) & 1)
             )
         else:
             pipeline_sm_stats.producer_acquire_w_index_phase(stage, sm_stats_producer_phase)
-        softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
+        if const_expr(not self.use_fixed_shift):
+            softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
         # acc_scale = cute.math.exp2(acc_scale_, fastmath=True)
         if const_expr(self.use_s_ping_pong):
             return s_p_o_consumer_count + 1, sm_stats_producer_phase, s0_s1_sequence_phase ^ 1
@@ -2747,6 +2809,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         tile_scheduler=None,
+        softmax_shift_log2: Optional[Float32] = None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -2861,23 +2924,25 @@ class FlashAttentionForwardSm100:
                         # wait for S0 / S1
                         # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
                         sm_stats_barrier.arrive_and_wait_w_index(index=sm_stats_index * 4 + warp_idx)
-                        # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
-                        # cute.arch.fence_view_async_tmem_load()
-                        # scale = tSrScale_t2r[0]
-                        scale = sScale[tidx + sm_stats_index * self.m_block_size]
-                        should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
-                        # should_rescale = True
-                        # if tidx == 0: cute.printf("Correction scale i = %d, for stage %d: %f, should_rescale = %d\n", i, stage, scale, should_rescale)
-                        # Don't need O_full anymore, since by the time softmax has signaled the correction
-                        # warps, S_i must have been done, so O_i-1 must have been done as well.
-                        # pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
-                        if should_rescale:
-                            if const_expr(self.use_s_ping_pong):
-                                # Ping-pong issues QK(i+1) before PV(i), so S_i+1 does not imply O_i is done
-                                pipeline_o_acc.consumer_wait_w_index_phase(
-                                    o_acc_consumer_count & 1, (o_acc_consumer_count >> 1) & 1
-                                )
-                            self.correction_rescale(thr_mma_pv, tOtO[None, None, None, stage], tidx, scale)
+                        # Fixed-shift softmax never changes the row shift: nothing to rescale.
+                        if const_expr(not self.use_fixed_shift):
+                            # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
+                            # cute.arch.fence_view_async_tmem_load()
+                            # scale = tSrScale_t2r[0]
+                            scale = sScale[tidx + sm_stats_index * self.m_block_size]
+                            should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
+                            # should_rescale = True
+                            # if tidx == 0: cute.printf("Correction scale i = %d, for stage %d: %f, should_rescale = %d\n", i, stage, scale, should_rescale)
+                            # Don't need O_full anymore, since by the time softmax has signaled the correction
+                            # warps, S_i must have been done, so O_i-1 must have been done as well.
+                            # pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
+                            if should_rescale:
+                                if const_expr(self.use_s_ping_pong):
+                                    # Ping-pong issues QK(i+1) before PV(i), so S_i+1 does not imply O_i is done
+                                    pipeline_o_acc.consumer_wait_w_index_phase(
+                                        o_acc_consumer_count & 1, (o_acc_consumer_count >> 1) & 1
+                                    )
+                                self.correction_rescale(thr_mma_pv, tOtO[None, None, None, stage], tidx, scale)
                         # Notify mma warp that O has been rescaled
                         if const_expr(self.use_s_ping_pong):
                             pipeline_s_p_o.consumer_release_w_index((o_acc_consumer_count + 1) & 1)
@@ -2919,7 +2984,13 @@ class FlashAttentionForwardSm100:
                     # scale = tSrScale_t2r[0]
                     row_sum = sScale[tidx + sm_stats_index * self.m_block_size]
                     if const_expr(mLSE is not None or learnable_sink is not None):
-                        row_max = sScale[tidx + sm_stats_index * self.m_block_size + self.s_p_o_stage * self.m_block_size]
+                        # Fixed-shift softmax has no row max (its LSE uses the shift); the placeholder keeps
+                        # `stats` the same structure on every path.
+                        row_max = (
+                            sScale[tidx + sm_stats_index * self.m_block_size + self.s_p_o_stage * self.m_block_size]
+                            if const_expr(not self.use_fixed_shift)
+                            else Float32(0.0)
+                        )
                     else:
                         row_max = None
                     pipeline_sm_stats.consumer_release_w_index(sm_stats_index)
@@ -3040,11 +3111,19 @@ class FlashAttentionForwardSm100:
                     # if tidx == 0 and stage <= 1:
                     #     cute.printf("row_sum = {}, row_max = {}, acc_O_mn_row_is_zero_or_nan = {}\n", row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                     LN2 = math.log(2.0)
-                    lse = (
-                        (row_max * softmax_scale_log2_eff + (cute.math.log2(row_sum, fastmath=True) - max_offset)) * LN2
-                        if not acc_O_mn_row_is_zero_or_nan
-                        else -Float32.inf
-                    )
+                    if const_expr(self.use_fixed_shift):
+                        # Weights are 2^(s * scale_log2 - shift_log2), so log2(row_sum) is relative to the shift.
+                        lse = (
+                            (softmax_shift_log2 + cute.math.log2(row_sum, fastmath=True)) * LN2
+                            if not acc_O_mn_row_is_zero_or_nan
+                            else -Float32.inf
+                        )
+                    else:
+                        lse = (
+                            (row_max * softmax_scale_log2_eff + (cute.math.log2(row_sum, fastmath=True) - max_offset)) * LN2
+                            if not acc_O_mn_row_is_zero_or_nan
+                            else -Float32.inf
+                        )
                     seqlen_q = (
                         seqlen.seqlen_q
                         if const_expr(not self.pack_gqa)

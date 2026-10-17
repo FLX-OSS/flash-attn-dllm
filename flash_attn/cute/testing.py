@@ -470,6 +470,90 @@ def attention_ref(
     return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
 
 
+def _bf16_bits_to_f32(bits: torch.Tensor) -> torch.Tensor:
+    w = (bits.to(torch.int64) & 0xFFFF) << 16
+    return torch.where(w >= 2**31, w - 2**32, w).to(torch.int32).view(torch.float32)
+
+
+def packed_exp2_bf16_ref(s: torch.Tensor, A: float, B: float, harden: bool = False) -> torch.Tensor:
+    """Bit-exact model of utils.packed_exp2_bf16x2 on consecutive pairs along the last dim of s.
+
+    s: fp32 scores (last dim even); A, B: fp32 coefficients (utils.packed_exp2_coeffs). Returns bf16
+    weights shaped like s. NaN outputs use torch's NaN encoding (the GPU writes 0x7FFF): compare NaN masks.
+    """
+    from flash_attn.cute.utils import PACKED_EXP2_K, PACKED_EXP2_KAPPA_BF16
+
+    assert s.dtype == torch.float32 and s.shape[-1] % 2 == 0
+    A64 = torch.tensor(A, dtype=torch.float32).item()
+    B64 = torch.tensor(B, dtype=torch.float32).item()
+    # fma.rn.f32x2(s, A, B): the fp64 product is exact. For |v| < 2^18 the fp32 result is an integer in
+    # [2^23, 2^24), so round half-to-even in exact integer arithmetic; otherwise fp64 holds v + B exactly.
+    v = s.double() * A64
+    v_floor = torch.floor(v)
+    frac = v - v_floor
+    base = v_floor + B64
+    up = (frac > 0.5) | ((frac == 0.5) & (torch.remainder(base, 2) == 1))
+    t = torch.where(v.abs() < 2.0**18, base + up.double(), v + B64).float()
+    # The GPU's fma returns the canonical NaN 0x7FFFFFFF.
+    R = torch.where(torch.isnan(t), 0xFFFF, t.view(torch.int32).to(torch.int64) & 0xFFFF)
+    if harden:  # max.bf16x2(R, -0.0): NaN and negative lanes become -0 (0x8000)
+        Rf = _bf16_bits_to_f32(R)
+        R = torch.where(torch.isnan(Rf) | (Rf < 0) | (R == 0x8000), 0x8000, R)
+    R_lo, R_hi = R[..., 0::2], R[..., 1::2]
+    # One 32-bit add for both lanes: a low-lane carry reaches the high lane, as on the GPU.
+    word = ((R_hi << 16) | R_lo) + ((PACKED_EXP2_K << 16) | PACKED_EXP2_K)
+    R2_lo, R2_hi = word & 0xFFFF, (word >> 16) & 0xFFFF
+    kappa = _bf16_bits_to_f32(torch.tensor(PACKED_EXP2_KAPPA_BF16)).item()
+    out = []
+    for r, r2 in ((R_lo, R2_lo), (R_hi, R2_hi)):
+        # Exact in fp32 (<= 18 significant bits), so one rounding to bf16 as in fma.rn.relu.bf16x2.
+        z = _bf16_bits_to_f32(r) * kappa + _bf16_bits_to_f32(r2)
+        out.append(torch.where(z < 0, torch.zeros_like(z), z).to(torch.bfloat16))
+    return torch.stack(out, dim=-1).reshape(s.shape)
+
+
+def attention_fixed_shift_ref(
+    q,
+    k,
+    v,
+    softmax_scale=None,
+    softmax_shift: float = 0.0,
+    key_padding_mask=None,
+    query_padding_mask=None,
+    harden: bool = False,
+):
+    """Model of softmax_mode="fixed_shift": fp64 scores rounded to fp32, bf16 weights from
+    packed_exp2_bf16_ref, and fp64 row sums of those weights and of P~ V. Masked keys weigh exactly 0.
+
+    q: (b, sq, h, d), k / v: (b, sk, h_k, d / dv). Returns (out fp32 (b, sq, h, dv), lse fp32 (b, h, sq)).
+    """
+    from flash_attn.cute.utils import LOG2_E, PACKED_EXP2_MAGIC
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+    f32 = lambda x: torch.tensor(x, dtype=torch.float32)  # noqa: E731
+    # Mirror the kernel's fp32 arithmetic: scale_log2 = fp32(scale) * fp32(log2 e), shift_log2 = fp32(.).
+    scale_log2 = f32(softmax_scale) * f32(LOG2_E)
+    shift_log2 = f32(softmax_shift * LOG2_E)
+    A = (scale_log2 * 128.0).item()
+    B = (f32(PACKED_EXP2_MAGIC) - shift_log2 * 128.0).item()
+    g = q.shape[2] // k.shape[2]
+    k, v = [repeat(t, "b s h d -> b s (h g) d", g=g) for t in (k, v)]
+    scores = torch.einsum("bthd,bshd->bhts", q.double(), k.double()).float()
+    sk = scores.shape[-1]
+    p = packed_exp2_bf16_ref(F.pad(scores, (0, sk % 2)), A, B, harden=harden)[..., :sk].double()
+    if key_padding_mask is not None:
+        p = p.masked_fill(rearrange(~key_padding_mask, "b s -> b 1 1 s"), 0.0)
+    row_sum = p.sum(dim=-1)
+    out = torch.einsum("bhts,bshd->bthd", p, v.double()) / rearrange(row_sum, "b h t -> b t h 1")
+    out = out.masked_fill(rearrange(row_sum == 0, "b h t -> b t h 1"), 0.0)
+    lse = (shift_log2.item() + torch.log2(row_sum)) * math.log(2.0)
+    lse = lse.masked_fill(row_sum == 0, -math.inf)
+    if query_padding_mask is not None:
+        out = out.masked_fill(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
+    return out.float(), lse.float()
+
+
 def maybe_fake_tensor_mode(fake: bool = True):
     """
     One way to populate/pre-compile cache is to use torch fake tensor mode,

@@ -462,6 +462,45 @@ class SoftmaxSm100(Softmax):
             )
 
     @cute.jit
+    def apply_packed_exp2(
+        self,
+        acc_S_row: cute.Tensor,
+        acc_P_row: cute.Tensor,
+        A: Float32,
+        B: Float32,
+        harden: cutlass.Constexpr[bool] = False,
+    ):
+        """Fixed-shift softmax: write the bf16 weights packed_exp2_bf16x2(S) straight into acc_P_row.
+
+        acc_S_row holds raw fp32 scores; (A, B) = utils.packed_exp2_coeffs(scale_log2, shift_log2).
+        """
+        assert acc_P_row.element_type is cutlass.BFloat16
+        acc_P_i32 = cute.recast_tensor(acc_P_row, cutlass.Int32)
+        assert cute.size(acc_P_i32) * 2 == cute.size(acc_S_row)
+        for i in cutlass.range_constexpr(cute.size(acc_P_i32)):
+            acc_P_i32[i] = utils.packed_exp2_bf16x2(
+                acc_S_row[2 * i], acc_S_row[2 * i + 1], A, B, harden=harden
+            )
+
+    @cute.jit
+    def update_row_sum_packed(self, acc_P_row: cute.Tensor, is_first: cutlass.Constexpr[bool]):
+        """Fixed-shift softmax: add the bf16 weights of acc_P_row to row_sum in fp32.
+
+        Summing the rounded weights keeps the denominator consistent with what P @ V consumes. There is
+        no rescaling, so row_sum simply accumulates.
+        """
+        acc_P_i32 = cute.recast_tensor(acc_P_row, cutlass.Int32)
+        num_acc = 4  # bf16x2 accumulator pairs, i.e. 8 independent fp32 chains of add.f32.bf16
+        acc = [Float32(0.0)] * (2 * num_acc)
+        for i in cutlass.range_constexpr(cute.size(acc_P_i32)):
+            j = i % num_acc
+            acc[2 * j], acc[2 * j + 1] = utils.add_bf16x2_to_f32x2(
+                acc_P_i32[i], acc[2 * j], acc[2 * j + 1]
+            )
+        total = ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]))
+        self.row_sum[0] = total if cutlass.const_expr(is_first) else self.row_sum[0] + total
+
+    @cute.jit
     def scale_apply_exp2_convert(
         self,
         acc_S_row: cute.Tensor,

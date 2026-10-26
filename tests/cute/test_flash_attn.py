@@ -514,8 +514,6 @@ def test_flash_attn_output(
     if d == 256 and IS_SM100:
         if has_learnable_sink:
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support learnable_sink yet")
-        if local:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support local attention yet")
         if softcap > 0.0:
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support softcap yet")
         if deterministic:
@@ -720,7 +718,8 @@ def test_flash_attn_output(
             and (
                 (dv == d and d <= 128)
                 or (d == 192 and dv == 128)
-                or (IS_SM100 and d == 256 and dv == 256 and softcap == 0.0)
+                # SM100 hd256 backward has no local-window support (forward only).
+                or (IS_SM100 and d == 256 and dv == 256 and softcap == 0.0 and not local)
             )
             # and False
             and not ((causal or local) and seqlen_k < seqlen_q)
@@ -1342,8 +1341,6 @@ def test_flash_attn_varlen_output(
     if d == 256 and IS_SM100:
         if has_learnable_sink:
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support learnable_sink yet")
-        if local:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support local attention yet")
         if softcap > 0.0:
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support softcap yet")
         if deterministic:
@@ -1661,7 +1658,8 @@ def test_flash_attn_varlen_output(
             and (
                 (dv == d and d <= 128)
                 or (d == 192 and dv == 128)
-                or (IS_SM100 and d == 256 and dv == 256 and softcap == 0.0)
+                # SM100 hd256 backward has no local-window support (forward only).
+                or (IS_SM100 and d == 256 and dv == 256 and softcap == 0.0 and not local)
             )
             and not has_learnable_sink
             # and False

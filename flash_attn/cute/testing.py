@@ -258,8 +258,11 @@ def construct_local_mask(
     key_padding_mask=None,
     key_leftpad=None,
     device=None,
+    window_left_anchor="query",
 ):
     row_idx = rearrange(torch.arange(seqlen_q, device=device, dtype=torch.long), "s -> s 1")
+    # "first_query": every row uses row 0's left edge (see flash_attn_varlen_func).
+    left_row_idx = row_idx if window_left_anchor == "query" else torch.zeros_like(row_idx)
     col_idx = torch.arange(seqlen_k, device=device, dtype=torch.long)
     if key_leftpad is not None:
         key_leftpad = rearrange(key_leftpad, "b -> b 1 1 1")
@@ -286,7 +289,7 @@ def construct_local_mask(
         return torch.logical_or(
             local_mask_left,
             torch.logical_and(
-                col_idx < row_idx + sk - sq - window_size[0], col_idx >= sink_token_length
+                col_idx < left_row_idx + sk - sq - window_size[0], col_idx >= sink_token_length
             ),
         )
 
@@ -348,6 +351,7 @@ def attention_ref(
     intermediate_dtype=None,
     return_lse=False,
     gather_kv_indices=None,
+    window_left_anchor="query",
 ):
     assert v is not None
     has_qk = q is not None and k is not None
@@ -403,6 +407,7 @@ def attention_ref(
             key_padding_mask,
             key_leftpad=key_leftpad,
             device=v.device,
+            window_left_anchor=window_left_anchor,
         )
     if attention_chunk > 0:
         chunk_mask = construct_chunk_mask(

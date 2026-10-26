@@ -679,6 +679,38 @@ def _mla_fwd_plan(
 
 
 SOFTMAX_MODES = ("online", "fixed_shift")
+WINDOW_LEFT_ANCHORS = ("query", "first_query")
+
+
+def _resolve_window_left_anchor(
+    window_left_anchor: str,
+    *,
+    local: bool,
+    window_size_left: Optional[int],
+    use_dedicated_hd256_kernel: bool,
+    requires_grad: bool,
+) -> bool:
+    """Whether a local window's left edge is anchored at each sequence's first query row.
+
+    "query" (default): row i sees keys j >= i + seqlen_k - seqlen_q - window_size_left.
+    "first_query": every row sees keys j >= seqlen_k - seqlen_q - window_size_left, the window of
+    the first query row (the per-row KV slice a block-diffusion canvas reads). Unsupported requests raise.
+    """
+    if window_left_anchor not in WINDOW_LEFT_ANCHORS:
+        raise ValueError(
+            f"window_left_anchor must be one of {WINDOW_LEFT_ANCHORS}, got {window_left_anchor!r}"
+        )
+    if window_left_anchor == "query":
+        return False
+    unsupported = [
+        (not local or window_size_left is None, "needs a local window with window_size[0] set"),
+        (not use_dedicated_hd256_kernel, "only the SM100/SM110 head_dim=256 kernel supports it"),
+        (requires_grad, "forward only: inputs must not require grad"),
+    ]
+    reasons = [reason for bad, reason in unsupported if bad]
+    if reasons:
+        raise ValueError(f"window_left_anchor='first_query' is not supported here: {'; '.join(reasons)}")
+    return True
 
 
 def _resolve_softmax_mode(
@@ -768,6 +800,7 @@ def _flash_attn_fwd(
     gather_bwd_recompute_p: bool = False,
     softmax_mode: Optional[str] = None,
     softmax_shift: float = 0.0,
+    window_left_anchor: str = "query",
 ) -> Tuple[
     torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]
 ]:
@@ -991,6 +1024,13 @@ def _flash_attn_fwd(
     # Preserve the caller's hint.
     host_max_seqlen_q = max_seqlen_q if not torch.is_tensor(max_seqlen_q) else None
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
+    window_left_from_first_query = _resolve_window_left_anchor(
+        window_left_anchor,
+        local=local,
+        window_size_left=window_size_left,
+        use_dedicated_hd256_kernel=use_dedicated_hd256_kernel,
+        requires_grad=requires_grad,
+    )
     if use_dedicated_hd256_kernel or (arch // 10 in [10, 11] and cu_seqlens_q is not None):
         max_seqlen_q = host_max_seqlen_q
     if (
@@ -1589,6 +1629,7 @@ def _flash_attn_fwd(
         use_dedicated_hd256_kernel and cu_seqlens_q is not None and host_max_seqlen_q is None,
         use_fixed_shift,
         fixed_shift_harden,
+        window_left_from_first_query,
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -1844,6 +1885,8 @@ def _flash_attn_fwd(
                     fa_fwd_kwargs["use_s_ping_pong"] = use_s_ping_pong
                     fa_fwd_kwargs["use_fixed_shift"] = use_fixed_shift
                     fa_fwd_kwargs["fixed_shift_harden"] = fixed_shift_harden
+                else:
+                    fa_fwd_kwargs["window_left_from_first_query"] = window_left_from_first_query
                 fa_fwd = flash_fwd_obj_cls(head_dim, head_dim_v, **fa_fwd_kwargs)
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
@@ -3870,6 +3913,7 @@ class FlashAttnFunc(torch.autograd.Function):
         gather_bwd_token_chunk: Optional[int] = None,
         softmax_mode: Optional[str] = None,
         softmax_shift: float = 0.0,
+        window_left_anchor: str = "query",
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3886,6 +3930,7 @@ class FlashAttnFunc(torch.autograd.Function):
             qv=qv,
             softmax_mode=softmax_mode,
             softmax_shift=softmax_shift,
+            window_left_anchor=window_left_anchor,
             softmax_scale=softmax_scale,
             causal=causal,
             window_size_left=window_size[0],
@@ -3949,9 +3994,9 @@ class FlashAttnFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 16)
+                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 17)
             else:
-                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 16)
+                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 17)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -3980,7 +4025,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 16)
+            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 17)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -4022,6 +4067,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         gather_bwd_token_chunk: Optional[int] = None,
         softmax_mode: Optional[str] = None,
         softmax_shift: float = 0.0,
+        window_left_anchor: str = "query",
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -4065,6 +4111,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             gather_bwd_recompute_p=gather_bwd_recompute_p,
             softmax_mode=softmax_mode,
             softmax_shift=softmax_shift,
+            window_left_anchor=window_left_anchor,
         )
         ctx.save_for_backward(
             q,
@@ -4138,9 +4185,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 18)
+                return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 19)
             else:
-                return dq, dk, dv, dqv, *((None,) * 12), dsink, *((None,) * 18)
+                return dq, dk, dv, dqv, *((None,) * 12), dsink, *((None,) * 19)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -4174,7 +4221,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 18)
+            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 19)
 
 
 def _validate_gather_bwd_kwargs(
@@ -4240,6 +4287,7 @@ def flash_attn_func(
     gather_bwd_token_chunk: Optional[int] = None,
     softmax_mode: Optional[str] = None,
     softmax_shift: float = 0.0,
+    window_left_anchor: str = "query",
 ):
     """See flash_attn_varlen_func for the arguments.
 
@@ -4257,6 +4305,12 @@ def flash_attn_func(
         output overflows, and z >~ 90 is silently dropped. See AI/FIXED_SHIFT_SOFTMAX.md.
     softmax_shift: the constant row shift for softmax_mode="fixed_shift", in natural-log units of
         softmax_scale * q.k. Ignored otherwise.
+    window_left_anchor: "query" (default) or "first_query". With a local window, row i of a sequence
+        sees keys j >= i + seqlen_k - seqlen_q - window_size[0] (bottom-right aligned); "first_query"
+        anchors the left edge at the sequence's first query row, so every row sees keys
+        j >= seqlen_k - seqlen_q - window_size[0] (right edge unchanged): the per-row KV slice a
+        block-diffusion canvas reads (e.g. DiffusionGemma's denoise step). Forward only (inputs must
+        not require grad); SM100/SM110 head_dim 256 only.
     """
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
@@ -4301,6 +4355,7 @@ def flash_attn_func(
         gather_bwd_token_chunk,
         softmax_mode,
         softmax_shift,
+        window_left_anchor,
     )
 
 
@@ -4340,6 +4395,7 @@ def flash_attn_varlen_func(
     gather_bwd_token_chunk: Optional[int] = None,
     softmax_mode: Optional[str] = None,
     softmax_shift: float = 0.0,
+    window_left_anchor: str = "query",
 ):
     """
     Tensor arguments:
@@ -4420,6 +4476,12 @@ def flash_attn_varlen_func(
         output overflows, and z >~ 90 is silently dropped. See AI/FIXED_SHIFT_SOFTMAX.md.
     softmax_shift: the constant row shift for softmax_mode="fixed_shift", in natural-log units of
         softmax_scale * q.k. Ignored otherwise.
+    window_left_anchor: "query" (default) or "first_query". With a local window, row i of a sequence
+        sees keys j >= i + seqlen_k - seqlen_q - window_size[0] (bottom-right aligned); "first_query"
+        anchors the left edge at the sequence's first query row, so every row sees keys
+        j >= seqlen_k - seqlen_q - window_size[0] (right edge unchanged): the per-row KV slice a
+        block-diffusion canvas reads (e.g. DiffusionGemma's denoise step). Forward only (inputs must
+        not require grad); SM100/SM110 head_dim 256 only.
     """
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
@@ -4460,6 +4522,7 @@ def flash_attn_varlen_func(
         gather_bwd_token_chunk,
         softmax_mode,
         softmax_shift,
+        window_left_anchor,
     )
 
 

@@ -68,6 +68,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         use_clc_scheduler: bool = False,
         has_tile_count_semaphore: bool = False,
         seqlen_k_per_split: Optional[int] = None,
+        window_left_from_first_query: bool = False,
     ):
         head_dim_v = head_dim if head_dim_v is None else head_dim_v
         assert head_dim == 256 and head_dim_v == 256, (
@@ -128,6 +129,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.is_persistent = False
         self.is_causal = is_causal
         self.is_local = is_local
+        # Per-row local window (see BlockInfo.window_left_from_first_query); needs is_local.
+        assert is_local or not window_left_from_first_query
+        self.window_left_from_first_query = window_left_from_first_query
         self.is_split_kv = is_split_kv
         self.use_semantic_trip_range = is_causal or is_local
         self.use_clc_scheduler = False
@@ -219,12 +223,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         assert aux_data.scalars is None, (
             "SM100 forward with head_dim=256 does not support aux_scalars"
         )
-        assert not self.is_local, (
-            "SM100 forward with head_dim=256 does not support local attention yet"
-        )
-        assert window_size_left is None and window_size_right is None, (
-            "SM100 forward with head_dim=256 does not support runtime window_size overrides"
-        )
+        if cutlass.const_expr(not self.is_local):
+            assert window_size_left is None and window_size_right is None, (
+                "SM100 forward with head_dim=256 takes window sizes only with is_local=True"
+            )
         assert descale_tensors is None, (
             "SM100 forward with head_dim=256 does not support descale_tensors"
         )
@@ -602,6 +604,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.shared_storage = SharedStorage
 
         grid = cute.round_up(grid, self.cluster_shape_mnk)
+        # Window sizes are runtime scalars (the compile key only records whether each is set).
+        window_size_left = Int32(window_size_left) if window_size_left is not None else None
+        window_size_right = Int32(window_size_right) if window_size_right is not None else None
         # Launch the kernel synchronously
         self.kernel(
             qk_tiled_mma,
@@ -907,6 +912,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             window_size_left=window_size_left,
             window_size_right=window_size_right,
             num_splits=num_splits,
+            window_left_from_first_query=self.window_left_from_first_query,
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
@@ -1038,6 +1044,12 @@ class BlackwellFusedMultiHeadAttentionForward:
                     tQgQ = tQgQ_qdl[None, mma_block_coord[0], None, mma_block_coord[2]]
 
                     seqlen_kv_loop_start, seqlen_kv_loop_end = n_block_min, n_block_max
+                    if cutlass.const_expr(self.is_local and mPageTable is not None):
+                        # An empty local range still runs one fully masked iteration; load a block
+                        # of this sequence for it (a far-left window can put n_block_min past the
+                        # sequence's pages, and 0 * a NaN V row is NaN).
+                        if seqlen_kv_loop_start >= seqlen_kv_loop_end:
+                            seqlen_kv_loop_start = cutlass.max(seqlen_kv_loop_end - 1, 0)
                     seqlen_kv_loop_steps = seqlen_kv_loop_end - seqlen_kv_loop_start
                     # Q
                     for iter in cutlass.range(self.iterations_qk, unroll=1):
@@ -1647,6 +1659,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 self.is_local,
                 window_size_left,
                 window_size_right,
+                window_left_from_first_query=self.window_left_from_first_query,
             )
         old_row_max = row_max
         row_max = tTMEM_LOADrS.load().reduce(cute.ReductionOp.MAX, row_max, 0)

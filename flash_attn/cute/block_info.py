@@ -23,6 +23,9 @@ class BlockInfo:
     # If True, the scheduler packs num_splits into the top 16 bits of split_idx
     pack_split_idx: cutlass.Constexpr[bool] = False
     num_n_blocks_per_split: Optional[cutlass.Constexpr[Int32]] = None
+    # Local window with its left edge anchored at the first query row (forward only): every row
+    # sees keys >= seqlen_k - seqlen_q - window_size_left instead of row + seqlen_k - seqlen_q - wl.
+    window_left_from_first_query: cutlass.Constexpr[bool] = False
 
     @cute.jit
     def get_n_block_min_max(
@@ -42,9 +45,12 @@ class BlockInfo:
             n_block_max = min(n_block_max, cute.ceil_div(n_idx_right, self.tile_n))
         n_block_min = 0
         if const_expr(self.is_local and self.window_size_left is not None):
-            m_idx_min = m_block * self.tile_m
-            if const_expr(self.qhead_per_kvhead_packgqa > 1):
-                m_idx_min = m_idx_min // self.qhead_per_kvhead_packgqa
+            if const_expr(self.window_left_from_first_query):
+                m_idx_min = 0
+            else:
+                m_idx_min = m_block * self.tile_m
+                if const_expr(self.qhead_per_kvhead_packgqa > 1):
+                    m_idx_min = m_idx_min // self.qhead_per_kvhead_packgqa
             n_idx = m_idx_min + seqlen_info.seqlen_k - seqlen_info.seqlen_q
             n_idx_left = n_idx - self.window_size_left
             n_block_min = cutlass.max(n_idx_left // self.tile_n, 0)
@@ -81,6 +87,7 @@ class BlockInfo:
 
     @cute.jit
     def get_m_block_min_max(self, seqlen_info: SeqlenInfoQK, n_block: Int32) -> Tuple[Int32, Int32]:
+        assert not self.window_left_from_first_query, "window_left_from_first_query is forward-only"
         m_block_max = cute.ceil_div(seqlen_info.seqlen_q, self.tile_m)
         m_block_min = 0
         if const_expr(self.is_causal or (self.is_local and self.window_size_right is not None)):
@@ -156,9 +163,12 @@ class BlockInfo:
         if const_expr(not self.is_local or self.window_size_left is None):
             return n_block_min
         else:
-            m_idx_max = (m_block + 1) * self.tile_m
-            if const_expr(self.qhead_per_kvhead_packgqa > 1):
-                m_idx_max = cute.ceil_div(m_idx_max, self.qhead_per_kvhead_packgqa)
+            if const_expr(self.window_left_from_first_query):
+                m_idx_max = 0  # one left edge for all rows
+            else:
+                m_idx_max = (m_block + 1) * self.tile_m
+                if const_expr(self.qhead_per_kvhead_packgqa > 1):
+                    m_idx_max = cute.ceil_div(m_idx_max, self.qhead_per_kvhead_packgqa)
             n_idx = m_idx_max + seqlen_info.seqlen_k - seqlen_info.seqlen_q
             n_idx_left = n_idx - self.window_size_left
             return cutlass.max(n_block_min, cute.ceil_div(n_idx_left, self.tile_n))

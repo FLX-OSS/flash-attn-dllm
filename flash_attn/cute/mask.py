@@ -1681,11 +1681,14 @@ class Sm100FusedMask:
             index_q,
             index_k,
         ),
+        window_left_from_first_query: cutlass.Constexpr[bool] = False,
     ):
         """Apply forward mask without mask_type.
 
         - If apply_semantic_window=True, apply causal/local window constraints.
         - Always apply residual OOB masking (index_k>=seqlen_k or index_q>=seqlen_q).
+        - window_left_from_first_query: the left window edge is the first query row's
+          (seqlen_k - seqlen_q - window_size_left) for every row.
         """
         offset = 0
         if cutlass.const_expr(apply_semantic_window):
@@ -1708,11 +1711,13 @@ class Sm100FusedMask:
                         if index_q + offset + window_size_right < index_k:
                             acc_qk[i] = -Float32.inf
                     elif cutlass.const_expr(window_size_right is None):
-                        if index_q + offset - window_size_left > index_k:
+                        index_q_left = 0 if const_expr(window_left_from_first_query) else index_q
+                        if index_q_left + offset - window_size_left > index_k:
                             acc_qk[i] = -Float32.inf
                     else:
+                        index_q_left = 0 if const_expr(window_left_from_first_query) else index_q
                         max_K_index = dsl_min(index_q + offset + window_size_right, seqlen_k)
-                        min_K_index = max(0, index_q + offset - window_size_left)
+                        min_K_index = max(0, index_q_left + offset - window_size_left)
                         if index_k > max_K_index or index_k < min_K_index:
                             acc_qk[i] = -Float32.inf
             # Residual mask is always needed for boundary protection.

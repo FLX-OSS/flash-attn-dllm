@@ -249,7 +249,11 @@ class FlashAttentionMLAForwardSm100:
         self.num_stages_Q = 1
         self.num_stages_K = 1
         self.num_stages_Qv = 2
-        self.num_stages_V = 4
+        # 4 V stages (32 KB each per CTA) with a 64-wide rope part use ~224 KB of smem; a
+        # 128-wide one adds 16 KB of Q/K tiles, so it keeps 3 (the O epilogue reuses them and
+        # needs num_hdimv_splits = 2).
+        assert hdim in (64, 128), f"MLA rope part must be 64 or 128 wide, got {hdim}"
+        self.num_stages_V = 4 if hdim == 64 else 3
         self.num_stages_S = 2
         # self.num_stages_P = 1 if has_qk else 2
         self.num_stages_P = 1
@@ -651,7 +655,9 @@ class FlashAttentionMLAForwardSm100:
 
         # ==== Set up Oi smem -> gmem tma store ====
 
-        self.overlap_sO_sV = True
+        # Overlapping O with the V ring reuses the last block's Vt slots, fixed at 2 and 3 only with
+        # 4 V stages (each 128-key block takes V0, V1, Vt0, Vt1). Otherwise O goes through Qv's buffer.
+        self.overlap_sO_sV = self.num_stages_V == 4
         if const_expr(self.overlap_sO_sV):
             num_stages_sO = self.num_stages_V
         else:

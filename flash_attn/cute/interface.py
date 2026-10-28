@@ -119,10 +119,14 @@ def _get_device_arch():
 
 
 @lru_cache(maxsize=None)
-def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int, alignment: int) -> None:
+def _validate_head_dims(
+    head_dim: int, head_dim_v: int, compute_capability: int, alignment: int, has_qv: bool = False
+) -> None:
     """Validate head dimension constraints based on compute capability."""
     is_deepseek_shape = head_dim == 192 and head_dim_v == 128
     is_deepseek_mla_absorbed_shape = (head_dim == 64 or head_dim == head_dim_v) and head_dim_v == 512
+    # MLA (qv) with a 128-wide rope part, e.g. DiffusionGemma's full-attention layers.
+    is_mla_rope128_shape = has_qv and head_dim == 128 and head_dim_v == 512
     is_dedicate_kernel_shape = head_dim == 256 and head_dim_v == 256
     is_standard_range = 8 <= head_dim <= 128 and 8 <= head_dim_v <= 128
 
@@ -133,9 +137,9 @@ def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int,
             f"head_dim and head_dim_v must be between 8 and 256 and divisible by {alignment}."
         )
     elif compute_capability in [10, 11]:
-        assert (is_standard_range or is_deepseek_shape or is_deepseek_mla_absorbed_shape or is_dedicate_kernel_shape) and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
+        assert (is_standard_range or is_deepseek_shape or is_deepseek_mla_absorbed_shape or is_dedicate_kernel_shape or is_mla_rope128_shape) and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
             f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM100/SM110. "
-            f"head_dim and head_dim_v must be between 8 and 128 and divisible by {alignment}, or (192, 128) for DeepSeek, or (256, 256) for hd256."
+            f"head_dim and head_dim_v must be between 8 and 128 and divisible by {alignment}, or (192, 128) for DeepSeek, or (256, 256) for hd256, or (64 or 128, 512) for MLA with qv."
         )
 
 
@@ -930,7 +934,7 @@ def _flash_attn_fwd(
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // v.element_size()
     if arch // 10 not in [8, 12]:
-        _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
+        _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment, has_qv=qv is not None)
     if softmax_scale is None:
         softmax_scale = (
             1.0 / math.sqrt(head_dim) if qv is None or q is None
@@ -1070,7 +1074,10 @@ def _flash_attn_fwd(
     )
     # num_splits < 1 (the split heuristic): 1CTA provisionally, re-decided after planning
     num_splits_auto = num_splits < 1
-    mla_1cta = qv is not None and mla_route(split_kv=num_splits_auto)
+    # A 128-wide rope part (q/k head_dim 128, e.g. DiffusionGemma) is 2CTA-only: the 1CTA
+    # kernels are written for DeepSeek's 64.
+    mla_rope128 = qv is not None and q is not None and head_dim == 128
+    mla_1cta = qv is not None and not mla_rope128 and mla_route(split_kv=num_splits_auto)
     
     # Sparse MLA pads a token's heads to the kernel's tile (pack_gqa.qheads_first_tma_view); the
     # kernel takes the real count, the interface needs the tile width for its grid math.
@@ -1262,7 +1269,15 @@ def _flash_attn_fwd(
         assert q is None or qv.shape[:-1] == q.shape[:-1]
         assert qv.shape[-1] == head_dim_v
         assert head_dim_v == 512
-        assert q is None or head_dim == 64
+        assert q is None or head_dim in (64, 128), "MLA rope part (q/k head_dim) must be 64 or 128"
+        if mla_rope128:
+            assert gather_kv_indices is None, "a 128-wide MLA rope part is dense only (no topk gather)"
+            assert not is_fp8 and all(t is None for t in (q_descale, k_descale, v_descale)), (
+                "a 128-wide MLA rope part has no fp8 / descale support"
+            )
+            assert page_table is None or page_size == tile_n, (
+                f"a 128-wide MLA rope part pages KV with TMA only (page_size {tile_n})"
+            )
         assert not local, "local not yet supported with qv"
         if not mla_1cta:
             assert q_descale is None and k_descale is None and v_descale is None, (
@@ -1566,6 +1581,8 @@ def _flash_attn_fwd(
         head_dim,
         head_dim_v,
         nheads_per_kv,  # the real count; qhead_per_kvhead must follow from the key
+        # The MLA kernels bake the kv-head count into their packed-GQA layouts (self.nheads_kv).
+        num_head_kv if qv is not None else None,
         causal,
         score_mod_hash,
         mask_mod_hash,
@@ -1833,6 +1850,7 @@ def _flash_attn_fwd(
                         disable_bitmask=disable_sparse_kv_bitmask,
                         has_qk=has_qk,
                         rescale_threshold=mla_fwd_rescale_threshold,
+                        hdim=head_dim if has_qk else 64,
                     )
             else:
                 if use_dedicated_hd256_kernel:
